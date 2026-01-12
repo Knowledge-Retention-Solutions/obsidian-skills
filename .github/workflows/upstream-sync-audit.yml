@@ -1,0 +1,159 @@
+name: Sync Upstream + Security Audit
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday 6:00 UTC
+  workflow_dispatch:      # Manual trigger
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync-and-audit:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: progressive-disclosure
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Sync from upstream
+        id: sync
+        run: |
+          git remote add upstream https://github.com/kepano/obsidian-skills.git || true
+          git fetch upstream
+
+          # Check if there are new changes
+          if git diff --quiet HEAD upstream/main -- skills/; then
+            echo "No changes from upstream"
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+          else
+            echo "Changes detected from upstream"
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+
+            # Create sync branch
+            BRANCH_NAME="sync-upstream-$(date +%Y%m%d-%H%M)"
+            git checkout -b "$BRANCH_NAME"
+            git merge upstream/main --no-edit -m "Sync from upstream kepano/obsidian-skills"
+            echo "branch_name=$BRANCH_NAME" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Security Audit - Control Characters
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Scanning for control characters..."
+          if LC_ALL=C grep -rn '[[:cntrl:]]' skills/ | grep -v $'\t' | grep -v $'\n'; then
+            echo "❌ FAILED: Control characters found"
+            exit 1
+          fi
+          echo "✅ PASSED: No suspicious control characters"
+
+      - name: Security Audit - Zero-Width Unicode
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Scanning for zero-width Unicode characters..."
+          FAILED=0
+          for file in $(find skills -name "*.md"); do
+            if xxd "$file" | grep -iE "e2808[bcdef]|efbbbf|e280[8a-8f]|e2808[0-9]"; then
+              echo "❌ Zero-width character found in: $file"
+              FAILED=1
+            fi
+          done
+          if [ $FAILED -eq 1 ]; then
+            exit 1
+          fi
+          echo "✅ PASSED: No zero-width characters"
+
+      - name: Security Audit - Prompt Injection Keywords
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Scanning for prompt injection keywords..."
+          # These patterns are red flags for prompt injection
+          PATTERNS="ignore.*(previous|above|prior|all).*instruction"
+          PATTERNS="$PATTERNS|forget.*instruction"
+          PATTERNS="$PATTERNS|disregard.*instruction"
+          PATTERNS="$PATTERNS|system.?prompt"
+          PATTERNS="$PATTERNS|developer.?mode"
+          PATTERNS="$PATTERNS|jailbreak"
+          PATTERNS="$PATTERNS|bypass.*safety"
+          PATTERNS="$PATTERNS|pretend.*(you|to be).*unrestricted"
+          PATTERNS="$PATTERNS|from now on.*ignore"
+          PATTERNS="$PATTERNS|you are now.*different"
+          PATTERNS="$PATTERNS|assume the role.*evil"
+
+          if grep -riE "$PATTERNS" skills/; then
+            echo "❌ FAILED: Prompt injection keywords found"
+            exit 1
+          fi
+          echo "✅ PASSED: No prompt injection keywords"
+
+      - name: Security Audit - HTML/Script Injection
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Scanning for HTML/Script injection..."
+          if grep -riE '(<script|<iframe|<object|<embed|javascript:|data:text/html|onclick=|onerror=)' skills/; then
+            echo "❌ FAILED: HTML/Script injection found"
+            exit 1
+          fi
+          echo "✅ PASSED: No HTML/Script injection"
+
+      - name: Security Audit - Persona Switch Patterns
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Scanning for persona switch patterns..."
+          PATTERNS="from now on you (are|must|will|should)"
+          PATTERNS="$PATTERNS|new persona"
+          PATTERNS="$PATTERNS|you are now a"
+          PATTERNS="$PATTERNS|you must always"
+          PATTERNS="$PATTERNS|never refuse"
+          PATTERNS="$PATTERNS|override.*previous"
+
+          if grep -riE "$PATTERNS" skills/; then
+            echo "❌ FAILED: Persona switch patterns found"
+            exit 1
+          fi
+          echo "✅ PASSED: No persona switch patterns"
+
+      - name: Push sync branch
+        if: steps.sync.outputs.has_changes == 'true'
+        run: |
+          git push origin ${{ steps.sync.outputs.branch_name }}
+
+      - name: Create Pull Request
+        if: steps.sync.outputs.has_changes == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr create \
+            --title "🔄 Sync upstream $(date +%Y-%m-%d) - Security Audit PASSED ✅" \
+            --body "## Automated Upstream Sync
+
+          This PR syncs changes from [kepano/obsidian-skills](https://github.com/kepano/obsidian-skills).
+
+          ### Security Audit Results
+
+          | Check | Status |
+          |-------|--------|
+          | Control Characters | ✅ Passed |
+          | Zero-Width Unicode | ✅ Passed |
+          | Prompt Injection Keywords | ✅ Passed |
+          | HTML/Script Injection | ✅ Passed |
+          | Persona Switch Patterns | ✅ Passed |
+
+          ### Review Checklist
+
+          - [ ] Reviewed diff for unexpected changes
+          - [ ] Semantic review of new content
+          - [ ] Tested skills locally
+
+          ---
+          🤖 Generated by GitHub Actions" \
+            --base progressive-disclosure \
+            --head ${{ steps.sync.outputs.branch_name }}
